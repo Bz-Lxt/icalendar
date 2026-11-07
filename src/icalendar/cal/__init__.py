@@ -14,7 +14,12 @@ from .event import Event
 from .free_busy import FreeBusy
 from .journal import Journal
 from .lazy import LazyCalendar
-from .timezone import Timezone, TimezoneDaylight, TimezoneStandard
+from .timezone import (
+    Timezone,
+    TimezoneDaylight,
+    TimezoneOnset,
+    TimezoneStandard,
+)
 from .todo import Todo
 
 __all__ = [
@@ -30,6 +35,7 @@ __all__ = [
     "LazyCalendar",
     "Timezone",
     "TimezoneDaylight",
+    "TimezoneOnset",
     "TimezoneStandard",
     "Todo",
 ]

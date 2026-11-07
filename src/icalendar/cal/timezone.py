@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta, tzinfo
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import dateutil.rrule
 import dateutil.tz
@@ -24,6 +24,26 @@ from icalendar.tools import to_datetime
 
 if TYPE_CHECKING:
     from icalendar.cal import Calendar
+
+
+class TimezoneOnset(NamedTuple):
+    """One point in local wall-clock time at which an offset changes.
+
+    The fold (offset becomes smaller) and jump (offset becomes larger)
+    intervals are fully determined by the local onset and the offsets
+    around it, so two VTIMEZONE definitions that agree on these triples
+    agree on the UTC instant of every local time, including ambiguous and
+    non-existent local times.
+    """
+
+    onset: datetime
+    """The naive local date-time at which the change takes effect."""
+
+    offset_from: timedelta
+    """The UTC offset in effect immediately before the onset."""
+
+    offset_to: timedelta
+    """The UTC offset in effect from the onset on."""
 
 
 class Timezone(Component):
@@ -145,6 +165,137 @@ class Timezone(Component):
             return str(self["TZID"])
         except UnicodeEncodeError:
             return self["TZID"].encode("ascii", "replace")
+
+    def get_onsets(self) -> tuple[TimezoneOnset, ...]:
+        """Return the local times at which the offset changes.
+
+        All ``STANDARD`` and ``DAYLIGHT`` recurrence rules and date lists are
+        expanded into naive local date-times, sorted chronologically. If
+        several subcomponents place an onset at the same local time, the
+        first one in document order is kept, matching the resolution order
+        of the timezone object created from this component.
+
+        The ``TZNAME`` values are intentionally ignored: two definitions that
+        carry different labels but identical onsets and offsets keep the same
+        time semantics.
+
+        Returns:
+            A tuple of :class:`TimezoneOnset` triples, one per local onset.
+        """
+        onsets: dict[datetime, TimezoneOnset] = {}
+        for component in self.walk():
+            if isinstance(component, Timezone):
+                continue
+            _is_dst, component_transitions = self._extract_offsets(
+                component, self.tz_name
+            )
+            for (
+                local_time,
+                offset_from,
+                offset_to,
+                _tzname,
+            ) in component_transitions:
+                # several subcomponents may share an onset; the first one in
+                # document order wins, as in dateutil's tzical resolution
+                onsets.setdefault(
+                    local_time,
+                    TimezoneOnset(local_time, offset_from, offset_to),
+                )
+        return tuple(onsets[local_time] for local_time in sorted(onsets))
+
+    def get_initial_offset(self) -> timedelta | None:
+        """Return the offset in effect before the first onset.
+
+        This mirrors the timezone object created from this component: before
+        the earliest onset, the ``TZOFFSETTO`` of the first ``STANDARD``
+        subcomponent (in document order) applies, or of the first
+        subcomponent when there is no ``STANDARD`` one.
+
+        Returns:
+            The initial UTC offset, or ``None`` for a VTIMEZONE without
+            subcomponents.
+        """
+        for component in self.subcomponents:
+            if component.name == "STANDARD":
+                return component.TZOFFSETTO
+        if not self.subcomponents:
+            return None
+        return self.subcomponents[0].get("TZOFFSETTO")
+
+    @classmethod
+    def equivalent_rules(
+        cls,
+        timezone_a: Timezone,
+        timezone_b: Timezone,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        margin: timedelta = timedelta(days=2),
+    ) -> bool:
+        """Check whether two VTIMEZONE components define equivalent rules.
+
+        Rules are equivalent when, throughout the relevant local-time
+        window, both definitions place onsets at the same local date-times
+        with the same offsets immediately before and after. Historical
+        offsets and the daylight saving fold and jump intervals are therefore
+        identical, no matter whether the rules are spelled via ``RRULE`` or
+        ``RDATE`` and regardless of the ``TZID`` and ``TZNAME`` values.
+
+        The checked window runs from ``start`` minus ``margin`` to ``end``
+        plus ``margin``. The margin guarantees that an onset whose fold
+        interval reaches into the relevant range is still taken into account.
+        The offset in effect when the window opens is compared as well, so
+        definitions with different earlier history are not confused.
+
+        With ``start`` and ``end`` both set to ``None``, the complete onset
+        sequences and initial offsets are compared. Definitions that cannot
+        be evaluated are never considered equivalent.
+
+        Parameters:
+            timezone_a: The first VTIMEZONE component.
+            timezone_b: The second VTIMEZONE component.
+            start: Earliest relevant naive local time, or ``None``.
+            end: Latest relevant naive local time, or ``None``.
+            margin: Extra local time considered on both sides of the window.
+
+        Returns:
+            ``True`` if both definitions are interchangeable in the window.
+        """
+        if timezone_a is timezone_b:
+            return True
+        try:
+            onsets_a = timezone_a.get_onsets()
+            onsets_b = timezone_b.get_onsets()
+            initial_a = timezone_a.get_initial_offset()
+            initial_b = timezone_b.get_initial_offset()
+        except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+            return False
+        if start is None or end is None:
+            return onsets_a == onsets_b and initial_a == initial_b
+        window_start = start - margin
+        window_end = end + margin
+        window_a = tuple(
+            onset for onset in onsets_a if window_start <= onset.onset <= window_end
+        )
+        window_b = tuple(
+            onset for onset in onsets_b if window_start <= onset.onset <= window_end
+        )
+        if window_a != window_b:
+            return False
+        entering_a = cls._entering_offset(onsets_a, initial_a, window_start)
+        entering_b = cls._entering_offset(onsets_b, initial_b, window_start)
+        return entering_a == entering_b
+
+    @staticmethod
+    def _entering_offset(
+        onsets: tuple[TimezoneOnset, ...],
+        initial_offset: timedelta | None,
+        window_start: datetime,
+    ) -> timedelta | None:
+        """Return the offset in effect immediately before ``window_start``."""
+        for onset in reversed(onsets):
+            if onset.onset < window_start:
+                return onset.offset_to
+        return initial_offset
 
     def get_transitions(
         self,
@@ -455,4 +606,4 @@ class TimezoneDaylight(Component):
     rrules = rrules_property
 
 
-__all__ = ["Timezone", "TimezoneDaylight", "TimezoneStandard"]
+__all__ = ["Timezone", "TimezoneDaylight", "TimezoneOnset", "TimezoneStandard"]

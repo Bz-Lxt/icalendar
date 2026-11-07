@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Literal, cast, overload
 
 from icalendar.attr import (
@@ -20,14 +20,15 @@ from icalendar.attr import (
 )
 from icalendar.cal.component import Component
 from icalendar.cal.examples import get_example
-from icalendar.cal.timezone import Timezone
+from icalendar.cal.timezone import Timezone, TimezoneOnset
 from icalendar.error import IncompleteComponent
 from icalendar.parser.ical.calendar import CalendarIcalParser
+from icalendar.prop import vDDDLists
 from icalendar.version import __version__
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
-    from datetime import date, datetime
+    from datetime import date
     from pathlib import Path
 
     from icalendar.cal import (
@@ -39,6 +40,9 @@ if TYPE_CHECKING:
     )
     from icalendar.compatibility import Self
     from icalendar.parser.ical.component import ComponentIcalParser
+
+# (component, TZID, expanded onsets, offset before the first onset)
+TimezoneRuleRecord = tuple[Timezone, str, tuple[TimezoneOnset, ...], timedelta | None]
 
 
 DEFAULT_PRODID = f"-//collective//icalendar//{__version__}//EN"
@@ -334,6 +338,229 @@ class Calendar(Component):
                 continue
             self.subcomponents.insert(existing_timezone_count, timezone)
             existing_timezone_count += 1
+
+    # components that define a timezone rather than referencing one by TZID
+    _TIMEZONE_DEFINITION_COMPONENTS = frozenset(("VTIMEZONE", "STANDARD", "DAYLIGHT"))
+
+    def merge_equivalent_timezones(
+        self, margin: timedelta = timedelta(days=2)
+    ) -> dict[str, str]:
+        """Merge embedded VTIMEZONE components with equivalent rules.
+
+        A calendar may contain several VTIMEZONE components whose TZIDs
+        differ while their STANDARD/DAYLIGHT transition rules describe the
+        same local time line. This keeps one component per set of equivalent
+        rules (the one with the lexicographically smallest TZID), removes the
+        redundant definitions, and rewrites every TZID reference in the
+        calendar to the kept TZID.
+
+        Definitions are merged only when they agree on every offset change
+        within the local-time range used by the calendar, enlarged by
+        ``margin`` on both sides. Historical offsets and daylight saving
+        fold and jump boundaries therefore keep resolving to the same UTC
+        instants; definitions that merely look similar but differ inside the
+        used range are left untouched. Definitions that cannot be evaluated,
+        or VTIMEZONEs that share a TZID without being equivalent, are never
+        removed.
+
+        The result is deterministic: it does not depend on the order of the
+        VTIMEZONE components, and calling the method again performs no
+        further changes.
+
+        Parameters:
+            margin: Extra local time considered around the earliest and
+                latest date-times of the calendar when comparing rules, so
+                that fold intervals reaching into the used range are seen.
+
+        Returns:
+            A mapping of each removed TZID to the TZID that replaces it;
+            an empty mapping means nothing was merged.
+        """
+        timezones = self.timezones
+        if len(timezones) < 2:
+            return {}
+
+        records = self._collect_timezone_records(timezones)
+        start, end = self._get_timezone_comparison_window(records)
+        groups = self._group_equivalent_timezones(records, start, end, margin)
+        rename, removed = self._select_timezone_merges(groups)
+
+        if rename:
+            self._replace_tzid_references(rename)
+        if removed:
+            self.subcomponents = [
+                component
+                for component in self.subcomponents
+                if id(component) not in removed
+            ]
+        return dict(sorted(rename.items()))
+
+    @staticmethod
+    def _collect_timezone_records(
+        timezones: list[Timezone],
+    ) -> list[TimezoneRuleRecord | None]:
+        """Prepare (component, tzid, onsets, initial offset) per VTIMEZONE.
+
+        ``None`` marks components that cannot be evaluated and must never be
+        merged away.
+        """
+        records: list[TimezoneRuleRecord | None] = []
+        for timezone in timezones:
+            try:
+                tzid = str(timezone["TZID"])
+                onsets = timezone.get_onsets()
+                initial_offset = timezone.get_initial_offset()
+            except (KeyError, ValueError, TypeError, AttributeError, OverflowError):
+                records.append(None)
+            else:
+                records.append((timezone, tzid, onsets, initial_offset))
+        return records
+
+    def _get_timezone_comparison_window(
+        self,
+        records: list[TimezoneRuleRecord | None],
+    ) -> tuple[datetime | None, datetime | None]:
+        """Return the earliest and latest relevant naive local times.
+
+        Prefer the local times referenced by TZID parameters; fall back to
+        the onset range of the definitions when no timezone is referenced.
+        """
+        wall_times: list[datetime] = []
+        for component in self.walk():
+            if component.name in self._TIMEZONE_DEFINITION_COMPONENTS:
+                continue
+            for _name, value in component.property_items(recursive=False, sorted=False):
+                params = getattr(value, "params", None)
+                if params is None or params.get("TZID") is None:
+                    continue
+                wall_times.extend(self._iter_naive_local_times(value))
+        if wall_times:
+            return min(wall_times), max(wall_times)
+        onset_times = [
+            onset.onset
+            for record in records
+            if record is not None
+            for onset in record[2]
+        ]
+        if onset_times:
+            return min(onset_times), max(onset_times)
+        return None, None
+
+    @staticmethod
+    def _iter_naive_local_times(value):
+        """Yield the naive local date-times carried by a property value."""
+        items = value.dts if isinstance(value, vDDDLists) else (value,)
+        for item in items:
+            dt = getattr(item, "dt", None)
+            halves = dt if isinstance(dt, tuple) else (dt,)
+            for half in halves:
+                if isinstance(half, datetime) and half.tzinfo is not None:
+                    yield half.replace(tzinfo=None)
+
+    @staticmethod
+    def _group_equivalent_timezones(
+        records: list[TimezoneRuleRecord | None],
+        start: datetime | None,
+        end: datetime | None,
+        margin: timedelta,
+    ) -> list[list[TimezoneRuleRecord]]:
+        """Group records with interchangeable rules.
+
+        Records are visited in lexicographic TZID order so the first member
+        of a group is the deterministic survivor.
+        """
+        ordered = sorted(
+            (
+                (index, record)
+                for index, record in enumerate(records)
+                if record is not None
+            ),
+            key=lambda item: (item[1][1], item[0]),
+        )
+        groups: list[list[TimezoneRuleRecord]] = []
+        for _index, record in ordered:
+            for group in groups:
+                representative = group[0]
+                if Timezone.equivalent_rules(
+                    representative[0], record[0], start, end, margin
+                ):
+                    group.append(record)
+                    break
+            else:
+                groups.append([record])
+        return groups
+
+    @staticmethod
+    def _select_timezone_merges(
+        groups: list[list[TimezoneRuleRecord]],
+    ) -> tuple[dict[str, str], set[int]]:
+        """Choose survivors and build the rename map and removed id set.
+
+        A TZID shared between different groups means equally named but
+        non-equivalent definitions; such groups are left untouched.
+        """
+        group_of_name: dict[str, int] = {}
+        conflicting_names: set[str] = set()
+        for group_index, group in enumerate(groups):
+            for _timezone, tzid, _onsets, _initial in group:
+                previous = group_of_name.get(tzid)
+                if previous is not None and previous != group_index:
+                    conflicting_names.add(tzid)
+                else:
+                    group_of_name[tzid] = group_index
+
+        rename: dict[str, str] = {}
+        removed: set[int] = set()
+        for group in groups:
+            if len(group) < 2:
+                continue
+            survivor = group[0]
+            survivor_tzid = survivor[1]
+            if survivor_tzid in conflicting_names:
+                continue
+            for timezone, tzid, _onsets, _initial in group[1:]:
+                removed.add(id(timezone))
+                if tzid != survivor_tzid:
+                    rename[tzid] = survivor_tzid
+        return rename, removed
+
+    def _replace_tzid_references(self, rename: dict[str, str]) -> None:
+        """Rewrite every TZID parameter and X-WR-TIMEZONE value."""
+        for component in self.walk():
+            if component.name in self._TIMEZONE_DEFINITION_COMPONENTS:
+                continue
+            for _name, value in component.property_items(recursive=False, sorted=False):
+                params = getattr(value, "params", None)
+                if params is not None:
+                    tzid = params.get("TZID")
+                    if tzid in rename:
+                        params["TZID"] = rename[tzid]
+                if isinstance(value, vDDDLists):
+                    for leaf in value.dts:
+                        leaf_params = getattr(leaf, "params", None)
+                        if leaf_params is None:
+                            continue
+                        leaf_tzid = leaf_params.get("TZID")
+                        if leaf_tzid in rename:
+                            leaf_params["TZID"] = rename[leaf_tzid]
+        self._replace_x_wr_timezone(rename)
+
+    def _replace_x_wr_timezone(self, rename: dict[str, str]) -> None:
+        """Rewrite the calendar-level X-WR-TIMEZONE property, if present."""
+        value = self.get("X-WR-TIMEZONE")
+        if value is None:
+            return
+        values = value if isinstance(value, list) else [value]
+        replaced = []
+        changed = False
+        for item in values:
+            if str(item) in rename:
+                changed = True
+                replaced.append(type(item)(rename[str(item)]))
+            else:
+                replaced.append(item)
+        if changed:
+            self["X-WR-TIMEZONE"] = replaced if isinstance(value, list) else replaced[0]
 
     calendar_name = multi_language_text_property(
         "NAME",
